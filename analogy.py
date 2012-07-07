@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import math
 import os
 import wave
 
@@ -65,7 +66,7 @@ def MakeFeatures(stfts):
   data = numpy.hstack(stfts)
   mean = numpy.mean(data, axis=1)
   u, s, v = numpy.linalg.svd(data, full_matrices=False)
-  basis = u[:,:10]
+  basis = u[:,:80]
   projected = []
   for stft in stfts:
     stft -= mean[:, numpy.newaxis]
@@ -89,27 +90,37 @@ def MakePyramid(data):
     pyramid.append(data.copy())
   pyramid.reverse()
   return pyramid
-  
 
-a = ReadWav(DATA_DIR + 'a.wav')
-ap = ReadWav(DATA_DIR + 'ap.wav')
-b = ReadWav(DATA_DIR + 'b.wav')
+def MelToHz(mel):
+  return 700.0 * (math.exp(mel / 1127.0) - 1.0)
 
-a_fft = STFT(a)
-ap_fft = STFT(ap)
-b_fft = STFT(b)
+def HzToMel(hz):
+  return 1127.0 * math.log(1.0 + hz / 700.0)
 
-features = MakeFeatures([a_fft, ap_fft, b_fft])
-pyramids = [MakePyramid(f) for f in features]
-a_pyr = pyramids[0]
-ap_pyr = pyramids[1]
-b_pyr = pyramids[2]
+def HzToBin(fft_bands, freq):
+  return int(math.floor(freq * fft_bands * 2.0 / float(SAMPLE_RATE)))
 
-result_pyramid = []
+def MakeMelFilterbank(mel_bands, fft_bands):
+  result = numpy.zeros((mel_bands, fft_bands + 1))
+  low_mel = HzToMel(40.0)
+  high_mel = HzToMel(16000.0)
+  center_mels = numpy.linspace(low_mel, high_mel, mel_bands + 2)
+
+  center_bins = [HzToBin(fft_bands, MelToHz(mel)) for mel in center_mels]
+
+  for i in range(mel_bands):
+    width_below = float(center_bins[i+1] - center_bins[i])
+    width_above = float(center_bins[i+2] - center_bins[i+1])
+    for j in range(center_bins[i], center_bins[i+1]+1):
+      result[i,j] = (j - center_bins[i]) / width_below
+    for j in  range(center_bins[i+1]+1, center_bins[i+2]):
+      result[i,j] = (center_bins[i+2] - j) / width_above
+
+  return result
 
 c3 = BinomialCoefs(3)
 c5 = BinomialCoefs(5)
-
+  
 def CurrentLevelFeatureVector(a, ap, center, behind, ahead):
   vector = []
   for i in range(-behind, ahead + 1):
@@ -123,45 +134,62 @@ def UpperLevelFeatureVector(a, ap, center, behind, ahead):
   for i in range(-behind, ahead + 1):
     vector.append(c3[i+1] * a[:,center+i])
     vector.append(c3[i+1] * ap[:,center+i])
-  return 1.6*numpy.array(vector).flatten()
+  return 2.0*numpy.array(vector).flatten()
 
-index_pyr = []
-for level in range(len(b_pyr)):
-  indices = []
-  for i in range(b_pyr[level].shape[1]):
-    best = -1
-    best_dist = 1e50
+if __name__ == '__main__':
+  a = ReadWav(DATA_DIR + 'a.wav')
+  ap = ReadWav(DATA_DIR + 'ap.wav')
+  b = ReadWav(DATA_DIR + 'b.wav')
 
-    look_behind = min(i, 2)
-    look_ahead = min(b_pyr[level].shape[1] - i - 1, 2)
-    if level > 0:
-      i_upper = i/2
-      look_behind_upper = min(i/2, 1)
-      look_ahead_upper = min(b_pyr[level-1].shape[1] - i_upper - 1, 1)
+  a_fft = STFT(a)
+  ap_fft = STFT(ap)
+  b_fft = STFT(b)
 
-    search_vec_current = CurrentLevelFeatureVector(b_pyr[level], b_pyr[level][:,indices], i, look_behind, look_ahead)
-    if level > 0:
-      search_vec_upper = UpperLevelFeatureVector(b_pyr[level-1], b_pyr[level-1][:,index_pyr[level-1]], i_upper, look_behind_upper, look_ahead_upper)
+  features = MakeFeatures([a_fft, ap_fft, b_fft])
+  pyramids = [MakePyramid(f) for f in features]
+  a_pyr = pyramids[0]
+  ap_pyr = pyramids[1]
+  b_pyr = pyramids[2]
 
-    for j in range(look_behind, a_pyr[level].shape[1] - look_ahead):
-      diff_current = search_vec_current - CurrentLevelFeatureVector(a_pyr[level], ap_pyr[level], j, look_behind, look_ahead)
-      dist = numpy.dot(diff_current, diff_current)
+  result_pyramid = []
+
+  index_pyr = []
+  for level in range(len(b_pyr)):
+    indices = []
+    for i in range(b_pyr[level].shape[1]):
+      best = -1
+      best_dist = 1e50
+
+      look_behind = min(i, 2)
+      look_ahead = min(b_pyr[level].shape[1] - i - 1, 2)
       if level > 0:
-        j_upper = j/2
-        diff_upper = search_vec_upper - UpperLevelFeatureVector(a_pyr[level-1], ap_pyr[level-1], j/2, look_behind_upper, look_ahead_upper)
-        dist += numpy.dot(diff_upper, diff_upper)
-      if dist < best_dist:
-        best_dist = dist
-        best = j
+        i_upper = i/2
+        look_behind_upper = min(i/2, 1)
+        look_ahead_upper = min(b_pyr[level-1].shape[1] - i_upper - 1, 1)
 
-    indices.append(best)
-  print indices
-  index_pyr.append(indices)
+      search_vec_current = CurrentLevelFeatureVector(b_pyr[level], b_pyr[level][:,indices], i, look_behind, look_ahead)
+      if level > 0:
+        search_vec_upper = UpperLevelFeatureVector(b_pyr[level-1], b_pyr[level-1][:,index_pyr[level-1]], i_upper, look_behind_upper, look_ahead_upper)
 
-triangle = numpy.concatenate((numpy.linspace(0.0, 1.0, 256), numpy.linspace(1.0, 0.0, 256)))
-result = numpy.zeros((256 * (1 + b_fft.shape[1])))
-final_idx = index_pyr[-1]
-for i, idx, in enumerate(final_idx):
-  result[i*256:i*256 + 512] += triangle * ap[indices[i]*256:indices[i]*256 + 512]
+      for j in range(look_behind, a_pyr[level].shape[1] - look_ahead):
+        diff_current = search_vec_current - CurrentLevelFeatureVector(a_pyr[level], ap_pyr[level], j, look_behind, look_ahead)
+        dist = numpy.dot(diff_current, diff_current)
+        if level > 0:
+          j_upper = j/2
+          diff_upper = search_vec_upper - UpperLevelFeatureVector(a_pyr[level-1], ap_pyr[level-1], j/2, look_behind_upper, look_ahead_upper)
+          dist += numpy.dot(diff_upper, diff_upper)
+        if dist < best_dist:
+          best_dist = dist
+          best = j
 
-WriteWav('bp.wav', result)
+      indices.append(best)
+    print indices
+    index_pyr.append(indices)
+
+  triangle = numpy.concatenate((numpy.linspace(0.0, 1.0, 256), numpy.linspace(1.0, 0.0, 256)))
+  result = numpy.zeros((256 * (1 + b_fft.shape[1])))
+  final_idx = index_pyr[-1]
+  for i, idx, in enumerate(final_idx):
+    result[i*256:i*256 + 512] += triangle * ap[indices[i]*256:indices[i]*256 + 512]
+
+  WriteWav('bp.wav', result)
