@@ -1,5 +1,9 @@
 #!/usr/bin/env python
 
+# extract raw (linear) features
+# make pyramids
+# nonlinear features per pyramid level
+
 import math
 import os
 import wave
@@ -59,7 +63,6 @@ def WriteWav(filename, data, channels=1, sample_rate=44100):
 
 def STFT(data):
   pxx, freqs, bins, im = matplotlib.pyplot.specgram(data, Fs=SAMPLE_RATE, NFFT=512, noverlap=256)
-  pxx = numpy.log(pxx)
   return pxx
 
 def MakeFeatures(stfts):
@@ -75,21 +78,15 @@ def MakeFeatures(stfts):
     projected.append(stft_proj)
   return projected
 
+coef_cache = {}
 def BinomialCoefs(size):
+  global coef_cache
+  if size in coef_cache:
+    return coef_cache[size]
   coefs = numpy.array([1.0, 1.0])
   while len(coefs) < size:
     coefs = numpy.convolve(coefs, numpy.array([1.0, 1.0]))
   return coefs / coefs.sum()
-
-def MakePyramid(data):
-  pyramid = [data.copy()]
-  coefs = BinomialCoefs(5)
-  while data.shape[1] > len(coefs):
-    data = scipy.ndimage.filters.convolve1d(data, coefs, axis=1)
-    data = data[:,::2]
-    pyramid.append(data.copy())
-  pyramid.reverse()
-  return pyramid
 
 def MelToHz(mel):
   return 700.0 * (math.exp(mel / 1127.0) - 1.0)
@@ -136,6 +133,39 @@ def UpperLevelFeatureVector(a, ap, center, behind, ahead):
     vector.append(c3[i+1] * ap[:,center+i])
   return 2.0*numpy.array(vector).flatten()
 
+class Pyramid1D(object):
+  def __init__(self, data):
+    self.levels = [data.copy()]
+    coefs = BinomialCoefs(5)
+    while (self.levels[-1].shape[1] > len(coefs)):
+      blur = scipy.ndimage.filters.convolve1d(self.levels[-1], coefs, axis=1)
+      self.levels.append(blur[:,::2])
+    self.levels.reverse()
+
+  def Map(self, fn):
+    """fn must transform a 2D array of column feature vectors to another 2D
+    array of column feature vectors.
+    """
+
+    self.levels = [fn(level) for level in self.levels]
+
+  def __len__(self):
+    return len(self.levels)
+
+  def __getitem__(self, key):
+    return self.levels[key]
+
+def MakeLogMelBands(data, linear_filter):
+  return numpy.log(numpy.dot(linear_filter, data))
+
+def Matrix1DFFT(data):
+  pass
+
+
+def SquaredDistance(a, b):
+  diff = a - b
+  return numpy.dot(diff, diff)
+
 if __name__ == '__main__':
   a = ReadWav(DATA_DIR + 'a.wav')
   ap = ReadWav(DATA_DIR + 'ap.wav')
@@ -145,11 +175,20 @@ if __name__ == '__main__':
   ap_fft = STFT(ap)
   b_fft = STFT(b)
 
-  features = MakeFeatures([a_fft, ap_fft, b_fft])
-  pyramids = [MakePyramid(f) for f in features]
-  a_pyr = pyramids[0]
-  ap_pyr = pyramids[1]
-  b_pyr = pyramids[2]
+  a_pyr = Pyramid1D(a_fft)
+  ap_pyr = Pyramid1D(ap_fft)
+  b_pyr = Pyramid1D(b_fft)
+
+  mel_coefs = MakeMelFilterbank(19, 256)
+  a_pyr.Map(lambda x: MakeLogMelBands(x, mel_coefs))
+  ap_pyr.Map(lambda x: MakeLogMelBands(x, mel_coefs))
+  b_pyr.Map(lambda x: MakeLogMelBands(x, mel_coefs))
+
+  #features = MakeFeatures([a_fft, ap_fft, b_fft])
+  #pyramids = [MakePyramid(f) for f in features]
+  #a_pyr = pyramids[0]
+  #ap_pyr = pyramids[1]
+  #b_pyr = pyramids[2]
 
   result_pyramid = []
 
@@ -172,12 +211,9 @@ if __name__ == '__main__':
         search_vec_upper = UpperLevelFeatureVector(b_pyr[level-1], b_pyr[level-1][:,index_pyr[level-1]], i_upper, look_behind_upper, look_ahead_upper)
 
       for j in range(look_behind, a_pyr[level].shape[1] - look_ahead):
-        diff_current = search_vec_current - CurrentLevelFeatureVector(a_pyr[level], ap_pyr[level], j, look_behind, look_ahead)
-        dist = numpy.dot(diff_current, diff_current)
+        dist = SquaredDistance(search_vec_current, CurrentLevelFeatureVector(a_pyr[level], ap_pyr[level], j, look_behind, look_ahead))
         if level > 0:
-          j_upper = j/2
-          diff_upper = search_vec_upper - UpperLevelFeatureVector(a_pyr[level-1], ap_pyr[level-1], j/2, look_behind_upper, look_ahead_upper)
-          dist += numpy.dot(diff_upper, diff_upper)
+          dist += SquaredDistance(search_vec_upper, UpperLevelFeatureVector(a_pyr[level-1], ap_pyr[level-1], j/2, look_behind_upper, look_ahead_upper))
         if dist < best_dist:
           best_dist = dist
           best = j
